@@ -7,11 +7,17 @@
 #include "../include/packet_parser.h"
 #include "../include/sni_extractor.h"
 #include "../include/types.h"
+#include "../include/tls_inspector.h" // ← NEW
 
 struct Flow {
     std::string sni;
-    AppType app = AppType::UNKNOWN;
-    bool blocked = false;
+    AppType     app     = AppType::UNKNOWN;
+    bool        blocked = false;
+
+    // TLS metadata (new)
+    std::string              tls_version;
+    bool                     tls_weak    = false;
+    std::vector<std::string> cipher_suites;
 };
 
 struct FiveTupleHash {
@@ -42,13 +48,10 @@ AppType sniToApp(const std::string& sni) {
     return AppType::UNKNOWN;
 }
 
-// Check if this domain should be blocked
 bool isBlocked(const std::string& sni,
                const std::unordered_set<std::string>& blocked_domains) {
     for (const auto& domain : blocked_domains) {
-        if (sni.find(domain) != std::string::npos) {
-            return true;
-        }
+        if (sni.find(domain) != std::string::npos) return true;
     }
     return false;
 }
@@ -60,8 +63,6 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Parse blocked domains from command line
-    // e.g. --block youtube --block facebook
     std::unordered_set<std::string> blocked_domains;
     for (int i = 2; i < argc - 1; i++) {
         if (std::string(argv[i]) == "--block") {
@@ -70,7 +71,6 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Open PCAP
     PcapReader reader;
     if (!reader.open(argv[1])) return 1;
 
@@ -78,6 +78,7 @@ int main(int argc, char* argv[]) {
 
     int total = 0, forwarded = 0, dropped = 0;
     int tcp_count = 0, udp_count = 0;
+    int weak_tls_count = 0;   // ← NEW: track weak TLS connections
     RawPacket raw;
 
     while (reader.readNextPacket(raw)) {
@@ -101,18 +102,41 @@ int main(int argc, char* argv[]) {
 
         Flow& flow = flows[tuple];
 
-        // Extract SNI for HTTPS traffic
+        // ── TLS Inspection (port 443) ──────────────────────────────────────
         if (parsed.dst_port == 443 && parsed.payload_len > 5) {
-            auto sni = SNIExtractor::extract(
-                parsed.payload,
-                parsed.payload_len
-            );
+
+            // 1. Deep TLS inspection (version, ciphers, handshake type)
+            TLSInfo tls = TLSInspector::inspect(parsed.payload, parsed.payload_len);
+
+            if (tls.is_tls && flow.tls_version.empty()) {
+                flow.tls_version  = tls.tls_version;
+                flow.tls_weak     = tls.is_weak;
+                flow.cipher_suites = tls.cipher_suites;
+
+                std::cout << "[TLS] " << tls.handshake_type
+                          << " | Version: " << tls.tls_version;
+
+                if (tls.is_weak) {
+                    std::cout << " ⚠ WEAK TLS";
+                    weak_tls_count++;
+                }
+                std::cout << "\n";
+
+                // Print cipher suites (first 3 only to avoid noise)
+                int shown = 0;
+                for (const auto& cs : tls.cipher_suites) {
+                    if (shown++ >= 3) { std::cout << "         ...\n"; break; }
+                    std::cout << "         Cipher: " << cs << "\n";
+                }
+            }
+
+            // 2. SNI extraction (existing logic, unchanged)
+            auto sni = SNIExtractor::extract(parsed.payload, parsed.payload_len);
             if (sni.found && flow.sni.empty()) {
                 flow.sni = sni.value;
                 flow.app = sniToApp(sni.value);
-                std::cout << "[SNI Found] " << sni.value;
+                std::cout << "[SNI] " << sni.value;
 
-                // Check if blocked
                 if (isBlocked(flow.sni, blocked_domains)) {
                     flow.blocked = true;
                     std::cout << " → BLOCKED";
@@ -121,7 +145,7 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // Drop or forward based on flow state
+        // ── Forward / Drop ─────────────────────────────────────────────────
         if (flow.blocked) {
             dropped++;
             std::cout << "[DROPPED] packet to " << flow.sni << "\n";
@@ -132,27 +156,40 @@ int main(int argc, char* argv[]) {
 
     reader.close();
 
-    // Print report
-    // Print report
-    std::cout << "\n==========================\n";
-    std::cout << "       DPI REPORT         \n";
-    std::cout << "==========================\n";
-    std::cout << "Total packets  : " << total     << "\n";
-    std::cout << "TCP packets    : " << tcp_count << "\n";
-    std::cout << "UDP packets    : " << udp_count << "\n";
-    std::cout << "Forwarded      : " << forwarded << "\n";
-    std::cout << "Dropped        : " << dropped   << "\n";
-    std::cout << "==========================\n";
-    std::cout << "  Detected Domains        \n";
-    std::cout << "==========================\n";
+    // ── Report ─────────────────────────────────────────────────────────────
+    std::cout << "\n==================================\n";
+    std::cout << "          DPI REPORT              \n";
+    std::cout << "==================================\n";
+    std::cout << "Total packets    : " << total          << "\n";
+    std::cout << "TCP packets      : " << tcp_count      << "\n";
+    std::cout << "UDP packets      : " << udp_count      << "\n";
+    std::cout << "Forwarded        : " << forwarded      << "\n";
+    std::cout << "Dropped          : " << dropped        << "\n";
+    std::cout << "Weak TLS conns   : " << weak_tls_count << "\n";   // ← NEW
+    std::cout << "==================================\n";
+    std::cout << "       Detected Flows             \n";
+    std::cout << "==================================\n";
+
     for (auto& [tuple, flow] : flows) {
         if (!flow.sni.empty()) {
-            std::cout << "  " << flow.sni;
+            std::cout << "  Domain  : " << flow.sni;
             if (flow.blocked) std::cout << " (BLOCKED)";
             std::cout << "\n";
+
+            if (!flow.tls_version.empty()) {
+                std::cout << "  TLS Ver : " << flow.tls_version;
+                if (flow.tls_weak) std::cout << " ⚠ WEAK";
+                std::cout << "\n";
+            }
+
+            if (!flow.cipher_suites.empty()) {
+                std::cout << "  Cipher  : " << flow.cipher_suites[0] << "\n";
+            }
+
+            std::cout << "  ──────────────────────────────\n";
         }
     }
-    std::cout << "==========================\n";
 
+    std::cout << "==================================\n";
     return 0;
 }
